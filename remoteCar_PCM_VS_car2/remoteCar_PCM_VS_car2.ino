@@ -25,14 +25,20 @@
  *                           System Specification                          *
  ***************************************************************************/
 #define WHEEL_DIA_MM 90
-//#define PI           3.1415
+#define PI           3.1415
 #define WHEEL_TRAVEL WHEEL_DIA_MM * PI
 #define CPR          757       // Count per Revolution
 
 #define SPEED_VARIANCE 5
 #define DEFAULT_MIN_SPEED 100  // in mm/s
 #define DEFAULT_MAX_SPEED 500  // in mm/s
+#define MIN_SPEED         50   // in mm/s
 #define MAX_SPEED         1000 // in mm/s
+
+#define SPEED_INC_1       8
+#define SPEED_INC_2       16
+#define SPEED_DEC_1       8
+#define SPEED_DECAY       0.9
 /***************************************************************************
  *                            Static Receive Code                          *
  ***************************************************************************/
@@ -68,17 +74,19 @@
 #define BRK     2
 
 #define AVG_LEN 4         // Averager length
-#define SEQ     0         // Toggle this to run sequence testing
 /***************************************************************************
  *                           Status Bit Definition                         *
  ***************************************************************************/
 #define PCM     BIT0      // Calculate the Current Speed
 #define CALC    BIT1      // Calculate the Target Speed
 #define READ    BIT2      // Receive latest command from bluetooth
+
+#define MODE_NORMAL   1        // Normal 5 speed configuration
+#define MODE_VARIABLE 2        // Variable Speed configuration
 /***************************************************************************
  *                                 Globals                                 *
  ***************************************************************************/
-volatile unsigned int counts[2] = {0};   // Real time counter for Left Channel A
+volatile unsigned int counts[2] = {0};         // Real time counter for Left Channel A
 const float KP = 2.63;                         // Proportion Control
 const float KI = 8.94;                         // Integral Control
 const float KD = 0.51;                         // Derivative Control
@@ -86,34 +94,19 @@ const float KD = 0.51;                         // Derivative Control
 float speedTotalError[2] = {0};                 // eIntegral for PID
 float pSpeedError[2] = {0};                     // Previous Error for the Derivative Control
 
-unsigned char code = 0;                  // Incoming code from Vision Controller
+unsigned char code = 0;                         // Incoming code from Vision Controller
+unsigned char mode; 
 
 unsigned int arrCounts[2][AVG_LEN] = {0};       // Ongoing Averager for the count
 size_t indexer = 0;                             // Iterator for the averager
 
 float speedY[2] = {0};                          // Current Speed (from reading)
 float speedR[2] = {0};                          // Speed Target
-int power[2] = {0};                   // power needed to drive for speed
+int power[2] = {0};                             // Power needed to drive for speed
 unsigned char motorDir[2] = {0};                // Direction of motors
 
 unsigned char status = 0;                       // Main loop status
 unsigned int speed[SPEED_VARIANCE];             // This is the range of speed the car uses
-
-/***************************************************************************
- *                               Test Run Values                           *
- ***************************************************************************/
-// Test sequence for increasing speed in 1 direction
-unsigned char testSequence1[] = {0x10, 0x11, 0x31, 0x33, 0x23, 0x22, 0x62, 0x66, 0x46, 0x44, 0x00};
-// Test sequence for direction switching
-unsigned char testSequence2[] = {0x22, 0xAA, 0x22, 0xAA, 0x00, 0x2A, 0xA2, 0x2A, 0xA2, 0x00, 0x00};
-// Test sequence for going to rest
-unsigned char testSequence3[] = {0x11, 0x00, 0x22, 0x00, 0x44, 0x00, 0xCC, 0x00, 0x44, 0x00, 0x00};
-// Test sequence for 1 sided scale
-unsigned char testSequence4[] = {0x01, 0x03, 0x02, 0x06, 0x04, 0x06, 0x02, 0x03, 0x01, 0x00, 0x00};
-// Test sequence for 1 sided 2 speeds
-unsigned char testSequence5[] = {0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02};
-size_t indexSequence = 0;
-bool runSEQ = SEQ;
 
 void setup() {
   Serial.begin(57600);
@@ -129,6 +122,8 @@ void setup() {
   pinMode(LIN2, OUTPUT);
   pinMode(LCHA, INPUT);
   attachInterrupt(digitalPinToInterrupt(LCHA), lPulse, RISING);
+  // Set the mode of the car
+  mode = MODE_VARIABLE;
   // Setup a timers
   cli();
   // Using Timer 2 because pin 11 and 13 is free
@@ -143,6 +138,7 @@ void setup() {
 void loop() {
   // Using pulse counting method to check amount of counts in each main loop
   static unsigned long pt;
+  static unsigned char receiverNotFound = 0;
   float currentCounts[2], dt;
   unsigned long t;
 
@@ -160,6 +156,9 @@ void loop() {
     t = millis();
     dt = (float)(t - pt) / 1000.0;
     pt = t;
+    // Incremental speed target if it is variable speed mode
+    if(mode == MODE_VARIABLE)
+      setSpeedTarget();
     // Using the delta T and count difference, together with CPR and wheel size
     // Find the speed the wheel travels at
     calculateCurrentSpeed(currentCounts, dt);
@@ -175,11 +174,61 @@ void loop() {
     status &= ~CALC;
   } else if(status & READ){   // Fetch code
     if(Serial.available()){
-      code = Serial.read();      
+      code = Serial.read();
+      receiverNotFound = 0;      
+    } else {
+      // failure to read 32 times (~5 seconds) will zero the code
+      if(++receiverNotFound >= 32)
+        code = receiverNotFound = 0;
     }
     status |= CALC;
     status &= ~READ;
   }  
+}
+
+/* setSpeedTarget
+ * This is a variable speed functionality that incrementally increase the speed or decrease based on received code
+ */
+void setSpeedTarget(){
+  // code 100 (4)= speed++
+  // code 110 (3)= speed+
+  // code 010 (2)= stay speed
+  // code 011 (1)= speed-
+  // code 001 (0)= speed%-
+  // code 000 = speed 0
+  size_t index[2];
+  index[LEFT] = speedIndexer((code & LSPD) >> 4);
+  index[RIGHT] = speedIndexer((code & RSPD));
+  switchSpeed(LEFT, index[LEFT]);
+  switchSpeed(RIGHT, index[RIGHT]);
+}
+
+/* switchSpeed
+ * This is the auxiliary method for the setSpeedTarget
+ * argument: side, the side of the wheel to configure
+ * argument: ind, the index of the wheel determined from the code
+ */
+void switchSpeed(int side, size_t ind){
+  switch(ind){
+    case 4:
+      if(speedR[side] < MAX_SPEED)
+        speedR[side] = min(speedR[side] + SPEED_INC_2, MAX_SPEED);
+      break;
+    case 3:
+      if(speedR[side] < MAX_SPEED)
+        speedR[side] = min(speedR[side] + SPEED_INC_1, MAX_SPEED);
+      break;
+    case 2: break;
+    case 1:
+      if(speedR[side] > MIN_SPEED)
+        speedR[side] = max(speedR[side] - SPEED_DEC_1, MIN_SPEED);
+      break;
+    case 0:
+      if(speedR[side] > MIN_SPEED)
+        speedR[side] = max(speedR[side] * SPEED_DECAY, MIN_SPEED);
+      break;
+    default: break;
+  }
 }
 
 /* setMotorPower
@@ -247,10 +296,18 @@ void updateTarget(){
   index[LEFT] = speedIndexer((code & LSPD) >> 4);
   index[RIGHT] = speedIndexer((code & RSPD));
   // Set the Target Speed R(s)
-  if(index[LEFT] != ERRSPD)
-    speedR[LEFT] = (index[LEFT] == SPEED_VARIANCE) ? 0 : speed[index[LEFT]];
-  if(index[RIGHT] != ERRSPD)
-    speedR[RIGHT] = (index[RIGHT] == SPEED_VARIANCE) ? 0 : speed[index[RIGHT]];
+  if(mode == MODE_NORMAL){
+    if(index[LEFT] != ERRSPD)
+      speedR[LEFT] = (index[LEFT] == SPEED_VARIANCE) ? 0 : speed[index[LEFT]];
+    if(index[RIGHT] != ERRSPD)
+      speedR[RIGHT] = (index[RIGHT] == SPEED_VARIANCE) ? 0 : speed[index[RIGHT]];
+  } else if(mode == MODE_VARIABLE){
+    // This mode only sets target speed to 0 if brake
+    if(index[LEFT] == SPEED_VARIANCE)
+      speedR[LEFT] = 0;
+    if(index[RIGHT] == SPEED_VARIANCE)
+      speedR[RIGHT] = 0;
+  }
 
   pSpeedCode = (code & (LSPD | RSPD));
 }
@@ -388,25 +445,13 @@ void lPulse(){
 ISR(TIMER2_COMPA_vect){
   static unsigned char i = 0, si = 0;
   i++;
-  if(runSEQ)
-    si++;
   
   if(i == 10)
     status |= PCM;    // Check Pulse every 8ms x 10 = 80ms of the 160ms
   if(i == 20){
     status |= READ;   // Check Serial import every 8ms x 10 = 80ms of the 160ms
     i = 0;
-  }
-
-  if(si == 250){
-    code = testSequence5[indexSequence++];
-    if(indexSequence == 12){
-      //runSEQ = false;
-      indexSequence = 0;
-    }
-    si = 0;
-  }
-  
+  }  
   TCNT2 = 0;
 }
 
